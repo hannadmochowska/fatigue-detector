@@ -21,6 +21,7 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
 
     df_1s = df[cols].resample("1S").mean()
 
+    # interpolate through gaps
     for col in cols:
         df_1s[col] = df_1s[col].interpolate(limit_direction="both")
 
@@ -31,7 +32,7 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     df_1s["delta_dist_m"] = df_1s["distance_m"].diff()
     df_1s["delta_elev"] = df_1s["elev_m"].diff()
 
-    # avoid tiny or negative distance deltas (GPS noise)
+    # avoid tiny or negative distance deltas (GPS noise / standing still)
     df_1s.loc[df_1s["delta_dist_m"] < 0.5, "delta_dist_m"] = np.nan
 
     # grade (unitless), then as percent
@@ -40,7 +41,8 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     df_1s["grade_pct"] = df_1s["grade"] * 100.0
 
     # vertical speed
-    df_1s["vertical_speed_mps"] = df_1s["delta_elev"]  # per second
+    # resampled at 1 Hz → delta_elev is already m/s
+    df_1s["vertical_speed_mps"] = df_1s["delta_elev"]
     df_1s["vertical_speed_mh"] = df_1s["vertical_speed_mps"] * 3600.0
 
     # terrain flags
@@ -48,6 +50,9 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     df_1s["is_uphill"] = df_1s["grade"] > uphill_thr
     df_1s["is_downhill"] = df_1s["grade"] < -uphill_thr
     df_1s["is_flat"] = (~df_1s["is_uphill"]) & (~df_1s["is_downhill"])
+
+    # convenience alias for early/late code
+    df_1s["cadence_spm"] = df_1s["cadence"]
 
     return df_1s
 
@@ -88,6 +93,18 @@ def _cv(series: pd.Series) -> float:
     return s / m
 
 
+def _cv(series: pd.Series) -> float:
+    """Coefficient of variation (std/mean) with safe NaN handling."""
+    series = series.dropna()
+    if series.empty:
+        return np.nan
+    m = series.mean()
+    s = series.std(ddof=0)
+    if m == 0 or np.isnan(m) or np.isnan(s):
+        return np.nan
+    return s / m
+
+
 def compute_early_late_features(df_1s: pd.DataFrame) -> dict:
     """
     Early/late HR, pace, and cadence features for fatigue detection.
@@ -96,38 +113,40 @@ def compute_early_late_features(df_1s: pd.DataFrame) -> dict:
         - 'hr'              (bpm)
         - 'pace_s_per_km'   (sec/km)
         - 'cadence_spm'     (steps per minute)
-
-    Returns:
-        - early_hr_mean, late_hr_mean, hr_mean_drift
-        - early/late mean pace + pace_s_per_km_mean_drift
-        - pace_cv_early, pace_cv_late, pace_cv_ratio
-        - cadence_cv_early, cadence_cv_late, cadence_cv_ratio
+        - 'is_flat'         (bool)  # for flat-only drifts
     """
-
-    # Very short / empty run → all NaNs
-    if df_1s is None or df_1s.empty or df_1s["hr"].count() < 60:
-        keys = [
-            "early_hr_mean", "late_hr_mean", "hr_mean_drift",
-            "early_pace_s_per_km_mean", "late_pace_s_per_km_mean",
-            "pace_s_per_km_mean_drift",
-            "pace_cv_early", "pace_cv_late", "pace_cv_ratio",
-            "cadence_cv_early", "cadence_cv_late", "cadence_cv_ratio",
-        ]
-        return {k: np.nan for k in keys}
-
+    feats = {}
     n = len(df_1s)
-    seg = max(n // 3, 1)   # use first and last third
-    early = df_1s.iloc[:seg]
-    late = df_1s.iloc[-seg:]
+    if n < 10:
+        # too short to say anything
+        feats["early_hr_mean"] = np.nan
+        feats["late_hr_mean"] = np.nan
+        feats["hr_mean_drift"] = np.nan
+        feats["early_pace_s_per_km_mean"] = np.nan
+        feats["late_pace_s_per_km_mean"] = np.nan
+        feats["pace_s_per_km_mean_drift"] = np.nan
+        feats["pace_cv_early"] = np.nan
+        feats["pace_cv_late"] = np.nan
+        feats["pace_cv_ratio"] = np.nan
+        feats["cadence_cv_early"] = np.nan
+        feats["cadence_cv_late"] = np.nan
+        feats["cadence_cv_ratio"] = np.nan
+        feats["flat_hr_mean_drift"] = np.nan
+        feats["flat_pace_mean_drift"] = np.nan
+        return feats
 
-    # Means
+    # --- full-run early/late segmentation ---
+    early, late = split_early_late(df_1s, frac=0.3)
+
+    # HR means + drift
     early_hr_mean = early["hr"].mean()
     late_hr_mean = late["hr"].mean()
     hr_mean_drift = late_hr_mean - early_hr_mean
 
+    # Pace means + drift (positive = slowdown)
     early_pace_mean = early["pace_s_per_km"].mean()
     late_pace_mean = late["pace_s_per_km"].mean()
-    pace_mean_drift = late_pace_mean - early_pace_mean  # + = slowdown
+    pace_mean_drift = late_pace_mean - early_pace_mean
 
     # CVs & ratios
     pace_cv_early = _cv(early["pace_s_per_km"])
@@ -144,7 +163,7 @@ def compute_early_late_features(df_1s: pd.DataFrame) -> dict:
         if cadence_cv_early not in (0, np.nan) else np.nan
     )
 
-    return {
+    feats.update({
         "early_hr_mean": early_hr_mean,
         "late_hr_mean": late_hr_mean,
         "hr_mean_drift": hr_mean_drift,
@@ -157,7 +176,36 @@ def compute_early_late_features(df_1s: pd.DataFrame) -> dict:
         "cadence_cv_early": cadence_cv_early,
         "cadence_cv_late": cadence_cv_late,
         "cadence_cv_ratio": cadence_cv_ratio,
-    }
+    })
+
+    # --- NEW: flat-only drift metrics ---
+    if "is_flat" in df_1s.columns:
+        flat = df_1s[df_1s["is_flat"]]
+
+        # require at least ~2 minutes of flat running
+        if len(flat) > 120:
+            n_flat = len(flat)
+            split_flat = n_flat // 2
+            early_flat = flat.iloc[:split_flat]
+            late_flat = flat.iloc[split_flat:]
+
+            early_flat_hr_mean = early_flat["hr"].mean()
+            late_flat_hr_mean = late_flat["hr"].mean()
+            early_flat_pace_mean = early_flat["pace_s_per_km"].mean()
+            late_flat_pace_mean = late_flat["pace_s_per_km"].mean()
+
+            feats["flat_hr_mean_drift"] = late_flat_hr_mean - early_flat_hr_mean
+            feats["flat_pace_mean_drift"] = (
+                late_flat_pace_mean - early_flat_pace_mean
+            )
+        else:
+            feats["flat_hr_mean_drift"] = np.nan
+            feats["flat_pace_mean_drift"] = np.nan
+    else:
+        feats["flat_hr_mean_drift"] = np.nan
+        feats["flat_pace_mean_drift"] = np.nan
+
+    return feats
 
 
 def count_pace_surges(
@@ -196,7 +244,7 @@ def compute_terrain_features(df_1s: pd.DataFrame) -> dict:
     """
     feats = {}
 
-    # total distance and gain
+    # total distance
     dist_start = df_1s["distance_m"].iloc[0]
     dist_end = df_1s["distance_m"].iloc[-1]
     total_dist_m = dist_end - dist_start
@@ -209,6 +257,7 @@ def compute_terrain_features(df_1s: pd.DataFrame) -> dict:
     feats["total_elev_gain_m"] = float(total_elev_gain_m)
     feats["total_distance_km"] = float(total_dist_km)
 
+    # elevation gain per km
     if not np.isnan(total_dist_km) and total_dist_km > 0:
         feats["elev_gain_per_km"] = total_elev_gain_m / total_dist_km
     else:
@@ -235,48 +284,12 @@ def compute_terrain_features(df_1s: pd.DataFrame) -> dict:
         feats["mean_grade_uphill_pct"] = np.nan
         feats["mean_vspeed_uphill_mh"] = np.nan
 
-    # simple "hilly" flag (tune threshold later if needed)
-    feats["is_hilly_run"] = (
-        feats["elev_gain_per_km"] is not np.nan
-        and feats["elev_gain_per_km"] is not None
-        and feats["elev_gain_per_km"] > 20.0  # m/km
-    )
-
-    return feats
-
-def compute_early_late_features(df_1s: pd.DataFrame) -> dict:
-    feats = {}
-    n = len(df_1s)
-    if n < 10:
-        # existing early/late logic here...
-        # and bail early if too short
-        feats["flat_hr_mean_drift"] = np.nan
-        feats["flat_pace_mean_drift"] = np.nan
-        return feats
-
-    # --- your existing early/late code here ---
-    # (pace means, std, cv, hr means, hr_mean_drift, pace_mean_drift, etc.)
-
-    # --- NEW: flat-only drift metrics ---
-    flat = df_1s[df_1s["is_flat"]]
-
-    if len(flat) > 120:  # require at least 2 minutes of flat running
-        n_flat = len(flat)
-        split_flat = n_flat // 2
-        early_flat = flat.iloc[:split_flat]
-        late_flat = flat.iloc[split_flat:]
-
-        early_flat_hr_mean = early_flat["hr"].mean()
-        late_flat_hr_mean = late_flat["hr"].mean()
-        early_flat_pace_mean = early_flat["pace_s_per_km"].mean()
-        late_flat_pace_mean = late_flat["pace_s_per_km"].mean()
-
-        feats["flat_hr_mean_drift"] = late_flat_hr_mean - early_flat_hr_mean
-        feats["flat_pace_mean_drift"] = (
-            late_flat_pace_mean - early_flat_pace_mean
-        )
+    # simple "hilly" flag (tune threshold as needed)
+    egpkm = feats["elev_gain_per_km"]
+    if np.isnan(egpkm):
+        feats["is_hilly_run"] = False
     else:
-        feats["flat_hr_mean_drift"] = np.nan
-        feats["flat_pace_mean_drift"] = np.nan
+        feats["is_hilly_run"] = egpkm > 20.0  # e.g. >20 m gain per km
 
     return feats
+
