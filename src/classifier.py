@@ -24,17 +24,57 @@ def apply_neuro_adjustment(cml_z: float, gpv_z: float, neuro_tag: str | None):
     gpv_adj = gpv_z + adj["dGPV"]
     return cml_adj, gpv_adj, adj["note"]
 
+def _session_adjusted_thresholds(session_type: str | None,
+                                 base_hi: float = 0.5,
+                                 base_lo: float = -0.5):
+    """
+    Adjust high/low thresholds for CML/GPV based on session type.
 
-def classify_from_scores(cml_z: float, gpv_z: float, hi: float = 0.5, lo: float = -0.5):
+    Idea:
+      - Intervals tolerate higher GPV before being 'regulation-limited'.
+      - Races tolerate higher CML and GPV.
+      - Long runs slightly more tolerant on CML.
+      - Easy runs are stricter (lower hi threshold).
     """
-    Purely objective classification from CML and GPV (no neuro input).
-    Uses hi/lo thresholds to decide quadrant.
+    if session_type is None:
+        return base_hi, base_lo, base_hi, base_lo  # hi_cml, lo_cml, hi_gpv, lo_gpv
+
+    st = session_type.lower()
+
+    hi_cml = base_hi
+    lo_cml = base_lo
+    hi_gpv = base_hi
+    lo_gpv = base_lo
+
+    if st == "interval":
+        hi_gpv = base_hi + 0.4  # allow more pacing variability
+    elif st == "race":
+        hi_cml = base_hi + 0.4
+        hi_gpv = base_hi + 0.3
+    elif st == "long":
+        hi_cml = base_hi + 0.2
+    elif st == "easy":
+        hi_cml = base_hi - 0.1
+        hi_gpv = base_hi - 0.1
+
+    return hi_cml, lo_cml, hi_gpv, lo_gpv
+
+
+def classify_from_scores(cml_z: float,
+                         gpv_z: float,
+                         session_type: str | None = None,
+                         hi: float = 0.5,
+                         lo: float = -0.5):
     """
-    # high / low flags
-    cml_high = cml_z > hi
-    cml_low  = cml_z < lo
-    gpv_high = gpv_z > hi
-    gpv_low  = gpv_z < lo
+    Purely objective classification from CML and GPV (no neuro input),
+    with thresholds adjusted for session type.
+    """
+    hi_cml, lo_cml, hi_gpv, lo_gpv = _session_adjusted_thresholds(session_type, hi, lo)
+
+    cml_high = cml_z > hi_cml
+    cml_low  = cml_z < lo_cml
+    gpv_high = gpv_z > hi_gpv
+    gpv_low  = gpv_z < lo_gpv
 
     if cml_high and gpv_low:
         label = "Type A — Body-limited"
@@ -55,27 +95,31 @@ def classify_from_scores(cml_z: float, gpv_z: float, hi: float = 0.5, lo: float 
     return label, short
 
 
-def classify_run(cml_z: float, gpv_z: float, neuro_tag: str | None = None,
-                 hi: float = 0.5, lo: float = -0.5) -> dict:
+
+def classify_run(cml_z: float,
+                 gpv_z: float,
+                 neuro_tag: str | None = None,
+                 session_type: str | None = None,
+                 hi: float = 0.5,
+                 lo: float = -0.5) -> dict:
     """
     Full classifier:
     - takes z-scored CML & GPV
-    - optionally applies neuro adjustment
-    - returns final label + intermediate info
+    - adjusts thresholds based on session type
+    - applies quadrant logic
+    - optionally shifts scores based on neuro_tag
     """
+    base_label, base_code = classify_from_scores(cml_z, gpv_z, session_type, hi, lo)
 
-    # objective-only classification first
-    base_label, base_code = classify_from_scores(cml_z, gpv_z, hi=hi, lo=lo)
+    cml_adj, gpv_adj, note = apply_neuro_adjustment(cml_z, gpv_z, neuro_tag)
+    final_label, final_code = classify_from_scores(cml_adj, gpv_adj, session_type, hi, lo)
 
-    # apply neuro layer
-    cml_adj, gpv_adj, neuro_note = apply_neuro_adjustment(cml_z, gpv_z, neuro_tag)
-    final_label, final_code = classify_from_scores(cml_adj, gpv_adj, hi=hi, lo=lo)
-
-    reasons = []
-    reasons.append(f"objective CML_z={cml_z:.2f}, GPV_z={gpv_z:.2f} → {base_label}")
-    if neuro_note:
-        reasons.append(f"neuro input: {neuro_note}")
-        reasons.append(f"after neuro adj → CML_z={cml_adj:.2f}, GPV_z={gpv_adj:.2f} → {final_label}")
+    reasons = [f"base → {base_label} (CML_z={cml_z:.2f}, GPV_z={gpv_z:.2f})"]
+    if neuro_tag is not None:
+        reasons.append(
+            f"neuro_tag='{neuro_tag}' ({note}); "
+            f"after adj → {final_label} (CML_adj={cml_adj:.2f}, GPV_adj={gpv_adj:.2f})"
+        )
 
     return {
         "base_label": base_label,
@@ -87,5 +131,7 @@ def classify_run(cml_z: float, gpv_z: float, neuro_tag: str | None = None,
         "CML_adj": cml_adj,
         "GPV_adj": gpv_adj,
         "neuro_tag": neuro_tag,
-        "reasons": "; ".join(reasons) if reasons else base_label,
+        "session_type": session_type,
+        "reasons": "; ".join(reasons),
     }
+

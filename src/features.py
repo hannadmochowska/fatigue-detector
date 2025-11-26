@@ -2,9 +2,18 @@ import numpy as np
 import pandas as pd
 from parse_tcx import parse_tcx
 
+# --- utility helpers -----------------------------------------------------
 
-import numpy as np
-import pandas as pd
+def _safe_cv(series: pd.Series) -> float:
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    m = s.mean()
+    v = s.std(ddof=0)
+    if m == 0 or np.isnan(m) or np.isnan(v):
+        return np.nan
+    return v / m
+
 
 def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -55,6 +64,93 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     df_1s["cadence_spm"] = df_1s["cadence"]
 
     return df_1s
+
+def compute_micro_pause_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Detect short 'micro-pauses' (1–5 s) on flat terrain where speed drops
+    sharply but doesn't turn into a full long stop.
+
+    Returns:
+        micro_pause_count
+        micro_pause_per_km
+        micro_pause_mean_s
+    """
+    feats = {
+        "micro_pause_count": np.nan,
+        "micro_pause_per_km": np.nan,
+        "micro_pause_mean_s": np.nan,
+    }
+
+    if "speed_mps" not in df_1s.columns or "distance_m" not in df_1s.columns:
+        return feats
+
+    df = df_1s.copy()
+    # Use only flat seconds for this metric
+    if "is_flat" in df.columns:
+        df = df[df["is_flat"]]
+
+    if df.empty:
+        return feats
+
+    # Moving median speed (exclude standing still)
+    moving = df["speed_mps"][df["speed_mps"] > 0.5]
+    if moving.empty:
+        return feats
+
+    median_speed = moving.median()
+    if median_speed <= 0:
+        return feats
+
+    # A 'pause' = speed < 30% of median running speed
+    df["is_pause"] = df["speed_mps"] < 0.3 * median_speed
+
+    # Label contiguous pause segments
+    pause_indices = np.where(df["is_pause"].values)[0]
+    if len(pause_indices) == 0:
+        feats["micro_pause_count"] = 0
+        feats["micro_pause_per_km"] = 0.0
+        feats["micro_pause_mean_s"] = 0.0
+        return feats
+
+    segments = []
+    start = pause_indices[0]
+    prev = pause_indices[0]
+
+    for idx in pause_indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+        else:
+            segments.append((start, prev))
+            start = idx
+            prev = idx
+    segments.append((start, prev))
+
+    durations = []
+    micro_count = 0
+
+    for s_idx, e_idx in segments:
+        dur = e_idx - s_idx + 1  # seconds
+        if 1 <= dur <= 5:
+            micro_count += 1
+            durations.append(dur)
+        # >5 s treated as full stop (e.g. red light) → ignored
+
+    if micro_count == 0:
+        feats["micro_pause_count"] = 0
+        feats["micro_pause_per_km"] = 0.0
+        feats["micro_pause_mean_s"] = 0.0
+        return feats
+
+    # distance in km
+    dist_m = df_1s["distance_m"].iloc[-1] - df_1s["distance_m"].iloc[0]
+    dist_km = dist_m / 1000.0 if dist_m > 0 else np.nan
+
+    feats["micro_pause_count"] = micro_count
+    feats["micro_pause_mean_s"] = float(np.mean(durations))
+    feats["micro_pause_per_km"] = (
+        micro_count / dist_km if dist_km and not np.isnan(dist_km) else np.nan
+    )
+    return feats
 
 
 def split_early_late(df: pd.DataFrame, frac: float = 0.3):
@@ -293,3 +389,363 @@ def compute_terrain_features(df_1s: pd.DataFrame) -> dict:
 
     return feats
 
+def compute_warmup_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Estimate how long it takes HR to stabilise.
+    We look at first 20 min (or full run if shorter), smooth HR,
+    and find the first time where HR slope stays small for ~3 min.
+    """
+    feats = {"warmup_stab_time_s": np.nan}
+
+    if "hr" not in df_1s.columns or "elapsed_s" not in df_1s.columns:
+        return feats
+
+    df = df_1s.copy()
+    max_window_s = min(df["elapsed_s"].iloc[-1], 20 * 60)  # cap at 20 min
+    df = df[df["elapsed_s"] <= max_window_s]
+
+    if len(df) < 60:
+        return feats
+
+    # Smooth HR with 30 s rolling mean
+    hr_smooth = df["hr"].rolling(window=30, min_periods=15).mean()
+
+    # Approximate slope over 30 s steps
+    slope = (hr_smooth.diff(30) / 30).abs()  # bpm per second
+
+    # We consider HR 'stable' if |slope| < 0.05 bpm/s (~3 bpm/min)
+    stable = slope < 0.05
+
+    # Require stability for at least 3 minutes
+    stable_run = stable.rolling(window=180, min_periods=60).mean()
+
+    stable_indices = np.where(stable_run >= 0.9)[0]
+    if len(stable_indices) == 0:
+        # never really stabilised → treat warmup_stab_time as full early window
+        feats["warmup_stab_time_s"] = float(max_window_s)
+    else:
+        t_stab = df["elapsed_s"].iloc[stable_indices[0]]
+        feats["warmup_stab_time_s"] = float(t_stab)
+
+    return feats
+
+def compute_finish_collapse_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Compare pace in mid-run vs final 10% of the run as an 'end collapse' metric.
+    Positive % means slowdown in the final part.
+    """
+    feats = {"finish_collapse_pct": np.nan}
+
+    if "pace_s_per_km" not in df_1s.columns or "elapsed_s" not in df_1s.columns:
+        return feats
+
+    df = df_1s.copy()
+    if len(df) < 120:
+        return feats
+
+    total_time = df["elapsed_s"].iloc[-1]
+    if total_time <= 0:
+        return feats
+
+    # Mid-run: 40–60% of time
+    mid_start = 0.4 * total_time
+    mid_end = 0.6 * total_time
+    mid = df[(df["elapsed_s"] >= mid_start) & (df["elapsed_s"] <= mid_end)]
+
+    # Final: last 10% of time
+    final_start = 0.9 * total_time
+    final = df[df["elapsed_s"] >= final_start]
+
+    if len(mid) < 30 or len(final) < 30:
+        return feats
+
+    mid_pace = mid["pace_s_per_km"].mean()
+    final_pace = final["pace_s_per_km"].mean()
+    if mid_pace <= 0:
+        return feats
+
+    collapse_pct = (final_pace - mid_pace) / mid_pace * 100.0
+    feats["finish_collapse_pct"] = float(collapse_pct)
+    return feats
+
+def compute_hr_recovery_features(df_1s: pd.DataFrame,
+                                 window_s: int = 10,
+                                 threshold_frac: float = 0.08) -> dict:
+    """
+    For each pace surge, measure how much HR drops 10 s after peak.
+    Higher recovery = better autonomic response.
+    """
+    feats = {"hr_recovery_10s_mean": np.nan}
+
+    if "speed_mps" not in df_1s.columns or "hr" not in df_1s.columns:
+        return feats
+
+    speeds = df_1s["speed_mps"].values
+    hrs = df_1s["hr"].values
+    n = len(df_1s)
+    if n <= window_s + 10:
+        return feats
+
+    surge_indices = []
+    i = window_s
+    while i < n - 10:
+        prev = speeds[i - window_s]
+        curr = speeds[i]
+        if prev > 0:
+            change = (curr - prev) / prev
+            if change > threshold_frac:
+                surge_indices.append(i)
+                # skip ahead to avoid counting the same surge repeatedly
+                i += window_s
+                continue
+        i += 1
+
+    if not surge_indices:
+        return feats
+
+    recoveries = []
+    for idx in surge_indices:
+        hr_peak = hrs[idx]
+        hr_after = hrs[idx + 10]
+        recoveries.append(hr_peak - hr_after)
+
+    if recoveries:
+        feats["hr_recovery_10s_mean"] = float(np.mean(recoveries))
+    return feats
+
+def compute_short_hr_drift_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Short-timescale HR variability: average 60 s rolling std of HR.
+    Higher values = more jitter / unstable control.
+    """
+    feats = {"hr_std_60s_mean": np.nan}
+
+    if "hr" not in df_1s.columns:
+        return feats
+
+    if len(df_1s) < 60:
+        return feats
+
+    hr_roll_std = df_1s["hr"].rolling(window=60, min_periods=30).std()
+    feats["hr_std_60s_mean"] = float(hr_roll_std.mean())
+    return feats
+
+def compute_session_summary_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Basic per-run summary features for session-type detection.
+    """
+    feats = {
+        "duration_min": np.nan,
+        "total_distance_km": np.nan,
+        "mean_hr": np.nan,
+        "pace_cv_run": np.nan,
+    }
+
+    if "elapsed_s" not in df_1s.columns or "distance_m" not in df_1s.columns:
+        return feats
+
+    duration_s = df_1s["elapsed_s"].iloc[-1]
+    feats["duration_min"] = float(duration_s / 60.0)
+
+    dist_m = df_1s["distance_m"].iloc[-1] - df_1s["distance_m"].iloc[0]
+    feats["total_distance_km"] = float(dist_m / 1000.0) if dist_m > 0 else np.nan
+
+    if "hr" in df_1s.columns:
+        feats["mean_hr"] = float(df_1s["hr"].mean())
+
+    if "pace_s_per_km" in df_1s.columns:
+        feats["pace_cv_run"] = _safe_cv(df_1s["pace_s_per_km"])
+
+    return feats
+
+def compute_neuro_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Bundle all neuro / cognitive-control related metrics into a single call.
+    """
+    feats = {}
+    feats.update(compute_micro_pause_features(df_1s))
+    feats.update(compute_warmup_features(df_1s))
+    feats.update(compute_finish_collapse_features(df_1s))
+    feats.update(compute_hr_recovery_features(df_1s))
+    feats.update(compute_short_hr_drift_features(df_1s))
+    feats.update(compute_session_summary_features(df_1s))
+    return feats
+
+import numpy as np
+import pandas as pd
+
+def compute_interval_pattern_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Detect whether the run contains *structured* intervals:
+    - repeated fast "ON" segments
+    - each ON segment at least ~20 s
+    - with slower "OFF" segments between them
+    - ON durations and gaps between ONs reasonably consistent
+
+    Returns:
+        interval_on_count           – number of detected ON segments (>= 20 s)
+        interval_off_count          – number of detected OFF segments
+        interval_patterns_consistent – True if pattern looks like real intervals
+    """
+    feats = {
+        "interval_on_count": 0,
+        "interval_off_count": 0,
+        "interval_patterns_consistent": False,
+    }
+
+    if "speed_mps" not in df_1s.columns:
+        return feats
+
+    df = df_1s.copy()
+
+    # 1 Hz data → smooth speed over ~7 s window to remove noise
+    df["speed_smooth"] = df["speed_mps"].rolling(7, center=True, min_periods=1).median()
+
+    # Use relative thresholds: fast vs base pace
+    base_speed = df["speed_smooth"].median()
+    if not np.isfinite(base_speed) or base_speed <= 0:
+        return feats
+
+    fast_thresh = base_speed * 1.15   # ≈ >15% faster than median pace
+    slow_thresh = base_speed * 0.90   # ≈ clearly slower than median
+
+    df["is_fast"] = df["speed_smooth"] > fast_thresh
+    df["is_slow"] = df["speed_smooth"] < slow_thresh
+
+    n = len(df)
+    if n == 0:
+        return feats
+
+    # Helper: collect contiguous segments from a boolean mask
+    def collect_segments(mask):
+        segments = []
+        start = None
+        for i, flag in enumerate(mask):
+            if flag:
+                if start is None:
+                    start = i
+            else:
+                if start is not None:
+                    segments.append((start, i - 1))
+                    start = None
+        if start is not None:
+            segments.append((start, n - 1))
+        return segments
+
+    fast_segments_all = collect_segments(df["is_fast"].values)
+    slow_segments_all = collect_segments(df["is_slow"].values)
+
+    # Only keep "real" ON segments: at least 20 s
+    min_on_dur = 20      # seconds
+    min_off_dur = 10     # seconds
+
+    on_segments = [(s, e) for (s, e) in fast_segments_all
+                   if (e - s + 1) >= min_on_dur]
+    off_segments = [(s, e) for (s, e) in slow_segments_all
+                    if (e - s + 1) >= min_off_dur]
+
+    on_durs = [e - s + 1 for (s, e) in on_segments]
+    off_durs = [e - s + 1 for (s, e) in off_segments]
+
+    feats["interval_on_count"] = len(on_durs)
+    feats["interval_off_count"] = len(off_durs)
+
+    # Need at least 3 ON segments to call it "intervals"
+    if len(on_durs) < 3:
+        return feats
+
+    # Coefficient of variation (allowing more variability than before)
+    def cv(arr):
+        if len(arr) == 0:
+            return np.nan
+        m = np.mean(arr)
+        return np.std(arr) / m if m > 0 else np.nan
+
+    on_cv = cv(on_durs)
+
+    # Gaps between ON segments (time from end of one ON to start of next)
+    gaps = []
+    for (s1, e1), (s2, e2) in zip(on_segments[:-1], on_segments[1:]):
+        gap = max(0, s2 - e1 - 1)
+        gaps.append(gap)
+
+    gaps_cv = cv(gaps)
+
+    # We are generous here: real workouts are not perfect metronomes.
+    # Typical criteria:
+    # - ON durations within ~40% CV
+    # - gaps between ONs within ~50% CV
+    consistent_on = (not np.isnan(on_cv)) and (on_cv <= 0.40)
+    consistent_gaps = (len(gaps) >= 2) and (not np.isnan(gaps_cv)) and (gaps_cv <= 0.50)
+
+    if consistent_on and consistent_gaps:
+        feats["interval_patterns_consistent"] = True
+
+    return feats
+
+def compute_hr_zone_features(df_1s: pd.DataFrame) -> dict:
+    """
+    Compute simple HR zone fractions based on per-second heart rate.
+
+    Zones are defined as % of run-specific HR_peak:
+        Z1: < 65%  of HR_peak
+        Z2: 65–75%
+        Z3: 75–85%
+        Z4: 85–92%
+        Z5: > 92%
+
+    Returns:
+        time_in_z1_frac ... time_in_z5_frac  (fractions of total valid HR samples)
+        hr_peak_run                         (peak HR for this run)
+        hr_mean_run                         (mean HR for this run)
+    """
+    feats = {
+        "time_in_z1_frac": np.nan,
+        "time_in_z2_frac": np.nan,
+        "time_in_z3_frac": np.nan,
+        "time_in_z4_frac": np.nan,
+        "time_in_z5_frac": np.nan,
+        "hr_peak_run": np.nan,
+        "hr_mean_run": np.nan,
+    }
+
+    if "hr" not in df_1s.columns:
+        return feats
+
+    hr = df_1s["hr"].dropna()
+    if hr.empty:
+        return feats
+
+    hr_peak = hr.max()
+    hr_mean = hr.mean()
+
+    feats["hr_peak_run"] = hr_peak
+    feats["hr_mean_run"] = hr_mean
+
+    # if peak HR is weirdly low (e.g. faulty sensor), bail
+    if not np.isfinite(hr_peak) or hr_peak <= 0:
+        return feats
+
+    # Define thresholds as % of hr_peak for now.
+    # If you want to use your true HRmax, you can replace hr_peak with a constant.
+    z1_hi = 0.65 * hr_peak
+    z2_hi = 0.75 * hr_peak
+    z3_hi = 0.85 * hr_peak
+    z4_hi = 0.92 * hr_peak
+    # z5: > z4_hi
+
+    total = len(hr)
+
+    z1 = (hr < z1_hi).sum() / total
+    z2 = ((hr >= z1_hi) & (hr < z2_hi)).sum() / total
+    z3 = ((hr >= z2_hi) & (hr < z3_hi)).sum() / total
+    z4 = ((hr >= z3_hi) & (hr < z4_hi)).sum() / total
+    z5 = (hr >= z4_hi).sum() / total
+
+    feats["time_in_z1_frac"] = z1
+    feats["time_in_z2_frac"] = z2
+    feats["time_in_z3_frac"] = z3
+    feats["time_in_z4_frac"] = z4
+    feats["time_in_z5_frac"] = z5
+
+    return feats
