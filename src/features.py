@@ -683,69 +683,122 @@ def compute_interval_pattern_features(df_1s: pd.DataFrame) -> dict:
 
     return feats
 
-def compute_hr_zone_features(df_1s: pd.DataFrame) -> dict:
+# -------------------------------------------------------------
+# CML / GPV SCORE AGGREGATION
+# -------------------------------------------------------------
+
+
+def compute_cml_gpv_scores(features_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute simple HR zone fractions based on per-second heart rate.
+    Add CML / GPV fatigue scores to the per-run feature table.
 
-    Zones are defined as % of run-specific HR_peak:
-        Z1: < 65%  of HR_peak
-        Z2: 65–75%
-        Z3: 75–85%
-        Z4: 85–92%
-        Z5: > 92%
-
-    Returns:
-        time_in_z1_frac ... time_in_z5_frac  (fractions of total valid HR samples)
-        hr_peak_run                         (peak HR for this run)
-        hr_mean_run                         (mean HR for this run)
+    Uses existing columns from earlier feature functions:
+      - hr_mean_drift, late_hr_mean, pace_s_per_km_mean_drift
+      - flat_hr_mean_drift, flat_pace_mean_drift, is_hilly_run
+      - pace_cv_early/late, cadence_cv_early/late
+      - surges_all_10s_8pct, surges_late_10s_8pct
+      - finish_collapse_pct, warmup_stab_time_s, micro_pause_per_km
+      - hr_std_60s_mean, hr_recovery_10s_mean
     """
-    feats = {
-        "time_in_z1_frac": np.nan,
-        "time_in_z2_frac": np.nan,
-        "time_in_z3_frac": np.nan,
-        "time_in_z4_frac": np.nan,
-        "time_in_z5_frac": np.nan,
-        "hr_peak_run": np.nan,
-        "hr_mean_run": np.nan,
-    }
 
-    if "hr" not in df_1s.columns:
-        return feats
+    df = features_df.copy()
 
-    hr = df_1s["hr"].dropna()
-    if hr.empty:
-        return feats
+    # ---------------------------------------------------------
+    # 1. Ratios from existing features
+    # ---------------------------------------------------------
+    df["pace_cv_ratio"] = df["pace_cv_late"] / df["pace_cv_early"]
+    df["cadence_cv_ratio"] = df["cadence_cv_late"] / df["cadence_cv_early"]
+    df["surge_ratio"] = df["surges_late_10s_8pct"] / df["surges_all_10s_8pct"]
 
-    hr_peak = hr.max()
-    hr_mean = hr.mean()
+    for col in ["pace_cv_ratio", "cadence_cv_ratio", "surge_ratio"]:
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
-    feats["hr_peak_run"] = hr_peak
-    feats["hr_mean_run"] = hr_mean
+    # ---------------------------------------------------------
+    # 2. Helper: z-score that works even with few runs
+    # ---------------------------------------------------------
+    def zscore(series: pd.Series) -> pd.Series:
+        # if everything is NaN → treat as neutral (0)
+        if series.notna().sum() == 0:
+            return pd.Series(0.0, index=series.index)
 
-    # if peak HR is weirdly low (e.g. faulty sensor), bail
-    if not np.isfinite(hr_peak) or hr_peak <= 0:
-        return feats
+        m = series.mean()
+        s = series.std(ddof=0)
 
-    # Define thresholds as % of hr_peak for now.
-    # If you want to use your true HRmax, you can replace hr_peak with a constant.
-    z1_hi = 0.65 * hr_peak
-    z2_hi = 0.75 * hr_peak
-    z3_hi = 0.85 * hr_peak
-    z4_hi = 0.92 * hr_peak
-    # z5: > z4_hi
+        # single run / zero variance → neutral (0)
+        if np.isnan(s) or s == 0:
+            return pd.Series(0.0, index=series.index)
 
-    total = len(hr)
+        return (series - m) / s
 
-    z1 = (hr < z1_hi).sum() / total
-    z2 = ((hr >= z1_hi) & (hr < z2_hi)).sum() / total
-    z3 = ((hr >= z2_hi) & (hr < z3_hi)).sum() / total
-    z4 = ((hr >= z3_hi) & (hr < z4_hi)).sum() / total
-    z5 = (hr >= z4_hi).sum() / total
+    # ---------------------------------------------------------
+    # 3. Physiology / terrain-based z-scores
+    # ---------------------------------------------------------
+    # Full-run drifts
+    df["z_hr_mean_drift_full"] = zscore(df["hr_mean_drift"])
+    df["z_late_hr_mean"] = zscore(df["late_hr_mean"])
+    df["z_pace_mean_drift_full"] = zscore(df["pace_s_per_km_mean_drift"])
 
-    feats["time_in_z1_frac"] = z1
-    feats["time_in_z2_frac"] = z2
-    feats["time_in_z3_frac"] = z3
-    feats["time_in_z4_frac"] = z4
-    feats["time_in_z5_frac"] = z5
+    # Flat-only drifts
+    df["z_hr_mean_drift_flat"] = zscore(df["flat_hr_mean_drift"])
+    df["z_pace_mean_drift_flat"] = zscore(df["flat_pace_mean_drift"])
 
-    return feats
+    # Variability / surges
+    df["z_pace_cv_ratio"] = zscore(df["pace_cv_ratio"])
+    df["z_cadence_cv_ratio"] = zscore(df["cadence_cv_ratio"])
+    df["z_surge_ratio"] = zscore(df["surge_ratio"])
+
+    # ---------------------------------------------------------
+    # 4. Physiology-based CML and GPV
+    # ---------------------------------------------------------
+    df["CML_full_z"] = (
+        df["z_hr_mean_drift_full"]
+        + 0.5 * df["z_late_hr_mean"]
+        + 0.5 * df["z_pace_mean_drift_full"]
+    )
+
+    df["CML_flat_z"] = (
+        df["z_hr_mean_drift_flat"]
+        + 0.5 * df["z_pace_mean_drift_flat"]
+    )
+
+    df["CML_phys_z"] = np.where(
+        df["is_hilly_run"] & df["CML_flat_z"].notna(),
+        df["CML_flat_z"],
+        df["CML_full_z"],
+    )
+
+    df["GPV_phys_z"] = (
+        df["z_pace_cv_ratio"]
+        + 0.5 * df["z_cadence_cv_ratio"]
+        + 0.5 * df["z_surge_ratio"]
+    )
+
+    # ---------------------------------------------------------
+    # 5. Neuro-ish contributions (warmup, collapse, recovery)
+    # ---------------------------------------------------------
+    df["z_micro_pause_per_km"] = zscore(df["micro_pause_per_km"])
+    df["z_warmup_stab_time_s"] = zscore(df["warmup_stab_time_s"])
+    df["z_finish_collapse_pct"] = zscore(df["finish_collapse_pct"])
+    df["z_hr_std_60s_mean"] = zscore(df["hr_std_60s_mean"])
+    # Invert recovery: lower recovery = worse → higher z = worse
+    df["z_hr_recovery_deficit"] = zscore(-df["hr_recovery_10s_mean"])
+
+    df["CML_neuro_z"] = (
+        0.4 * df["z_finish_collapse_pct"]
+        + 0.3 * df["z_warmup_stab_time_s"]
+        + 0.3 * df["z_hr_std_60s_mean"]
+    )
+
+    df["GPV_neuro_z"] = (
+        0.4 * df["z_micro_pause_per_km"]
+        + 0.3 * df["z_hr_std_60s_mean"]
+        + 0.3 * df["z_hr_recovery_deficit"]
+    )
+
+    # ---------------------------------------------------------
+    # 6. Final combined scores
+    # ---------------------------------------------------------
+    df["CML_z"] = (df["CML_phys_z"] + df["CML_neuro_z"]).fillna(0.0)
+    df["GPV_z"] = (df["GPV_phys_z"] + df["GPV_neuro_z"]).fillna(0.0)
+
+    return df
