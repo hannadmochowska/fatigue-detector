@@ -224,6 +224,7 @@ def _auto_analyse_all(
 
     bar = st.progress(0, text=f"Auto-analysing {len(to_do)} runs…")
     analysed = 0
+    failed = 0
 
     for i, act in enumerate(to_do):
         run_id = str(act["id"])
@@ -251,8 +252,11 @@ def _auto_analyse_all(
                 user_id=user_id,
             )
             analysed += 1
-        except Exception:
-            pass  # skip silently — bad data or API error for one run shouldn't block the rest
+        except Exception as e:
+            failed += 1
+            # Surface first error to help debugging
+            if failed == 1:
+                st.warning(f"Auto-analyse: skipping run {run_id} — {e}")
         finally:
             bar.progress((i + 1) / len(to_do), text=f"Auto-analysing {len(to_do)} runs… ({i+1}/{len(to_do)})")
 
@@ -514,6 +518,8 @@ with st.sidebar:
                     msg = f"Found {len(acts)} runs"
                     if n_new:
                         msg += f" · auto-analysed {n_new} new"
+                    elif acts:
+                        msg += " · all already analysed"
                     (st.success(msg) if acts else st.warning("No runs found."))
                 except Exception as e:
                     st.error(f"Garmin error: {e}")
