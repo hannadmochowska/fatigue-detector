@@ -26,6 +26,26 @@ from run_pipeline import CLASSIFIED_CSV, run_single
 
 load_dotenv()
 
+# ── Password gate ─────────────────────────────────────────────────────────────
+def _check_password() -> bool:
+    correct = os.environ.get("APP_PASSWORD", "")
+    if not correct:
+        return True  # no password set → open access (local dev)
+    if st.session_state.get("authenticated"):
+        return True
+    st.markdown("## 🏃 Fatigue Detector")
+    pwd = st.text_input("Enter password", type="password", key="pwd_input")
+    if st.button("Log in"):
+        if pwd == correct:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    st.stop()
+    return False
+
+_check_password()
+
 # (v1 migration removed — classified_runs_v1.csv only contains raw features, no dates or labels)
 
 # ── Cloud storage: pull latest CSV from GitHub on each cold start ─────────────
