@@ -518,8 +518,6 @@ with st.sidebar:
                     msg = f"Found {len(acts)} runs"
                     if n_new:
                         msg += f" · auto-analysed {n_new} new"
-                    elif acts:
-                        msg += " · all already analysed"
                     (st.success(msg) if acts else st.warning("No runs found."))
                 except Exception as e:
                     st.error(f"Garmin error: {e}")

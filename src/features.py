@@ -54,11 +54,11 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     df_1s["vertical_speed_mps"] = df_1s["delta_elev"]
     df_1s["vertical_speed_mh"] = df_1s["vertical_speed_mps"] * 3600.0
 
-    # terrain flags
+    # terrain flags (fillna so NaN grades don't produce nullable booleans)
     uphill_thr = 0.02  # 2% grade
-    df_1s["is_uphill"] = df_1s["grade"] > uphill_thr
-    df_1s["is_downhill"] = df_1s["grade"] < -uphill_thr
-    df_1s["is_flat"] = (~df_1s["is_uphill"]) & (~df_1s["is_downhill"])
+    df_1s["is_uphill"]   = (df_1s["grade"] > uphill_thr).fillna(False)
+    df_1s["is_downhill"] = (df_1s["grade"] < -uphill_thr).fillna(False)
+    df_1s["is_flat"]     = (~df_1s["is_uphill"]) & (~df_1s["is_downhill"])
 
     # convenience alias for early/late code
     df_1s["cadence_spm"] = df_1s["cadence"]
