@@ -78,9 +78,13 @@ def run_single(
     session_type: str | None = None,
     save_history: bool = True,
     run_date: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[dict, pd.Series, pd.DataFrame]:
     """
     Full pipeline for a single run.
+
+    user_id: when set and Supabase is configured, reads/writes per-user data
+             from Supabase instead of local CSV files.
 
     Returns:
         result      – classify_run output dict (includes CML_z, GPV_z, final_label, reasons …)
@@ -90,11 +94,20 @@ def run_single(
     df_1s = resample_to_1s(df_raw)
     feats = compute_all_features(df_1s)
 
-    # Load existing history and append new run
-    if HISTORY_CSV.exists():
-        history = pd.read_csv(HISTORY_CSV, low_memory=False)
-    else:
-        history = pd.DataFrame()
+    # Load existing feature history for z-score computation
+    history = pd.DataFrame()
+    _use_supabase = False
+    if user_id:
+        try:
+            from supabase_db import load_features, is_enabled
+            if is_enabled():
+                history = load_features(user_id)
+                _use_supabase = True
+        except Exception:
+            pass
+    if not _use_supabase:
+        if HISTORY_CSV.exists():
+            history = pd.read_csv(HISTORY_CSV, low_memory=False)
 
     new_row = pd.DataFrame(
         [{"run_id": run_id, "session_type": session_type, "neuro_tag": neuro_tag, **feats}]
@@ -123,49 +136,57 @@ def run_single(
     result["CML_z"] = float(this_run["CML_z"])
     result["GPV_z"] = float(this_run["GPV_z"])
 
+    run_date_str = _resolve_date(run_date, df_1s)
+
     if save_history:
-        # Persist updated history (features only, not z-scores — they shift as runs are added)
-        new_row_with_meta = new_row.copy()
-        combined_features = pd.concat(
-            [history[[c for c in history.columns if c in new_row.columns]],
-             new_row_with_meta],
-            ignore_index=True,
-        )
-        combined_features.to_csv(HISTORY_CSV, index=False)
+        classified_data = {
+            "run_id":      run_id,
+            "date":        run_date_str,
+            "session_type":session_type,
+            "neuro_tag":   neuro_tag,
+            "final_label": result["final_label"],
+            "base_label":  result["base_label"],
+            "final_code":  result["final_code"],
+            "CML_z":       result["CML_z"],
+            "GPV_z":       result["GPV_z"],
+            "CML_adj":     result["CML_adj"],
+            "GPV_adj":     result["GPV_adj"],
+            "reasons":     result["reasons"],
+        }
 
-        # Persist classification result
-        classified_row = pd.DataFrame(
-            [
-                {
-                    "run_id": run_id,
-                    "date": _resolve_date(run_date, df_1s),
-                    "session_type": session_type,
-                    "neuro_tag": neuro_tag,
-                    "final_label": result["final_label"],
-                    "base_label": result["base_label"],
-                    "final_code": result["final_code"],
-                    "CML_z": result["CML_z"],
-                    "GPV_z": result["GPV_z"],
-                    "CML_adj": result["CML_adj"],
-                    "GPV_adj": result["GPV_adj"],
-                    "reasons": result["reasons"],
-                }
-            ]
-        )
-        if CLASSIFIED_CSV.exists():
-            existing = pd.read_csv(CLASSIFIED_CSV)
-            existing = existing[existing["run_id"] != run_id]
-            updated = pd.concat([existing, classified_row], ignore_index=True)
+        if _use_supabase and user_id:
+            # ── Supabase (multi-user) ────────────────────────────────────────
+            try:
+                from supabase_db import save_run, save_features
+                save_run(user_id, classified_data)
+                save_features(user_id, run_id, session_type, neuro_tag, feats)
+            except Exception:
+                pass
         else:
-            updated = classified_row
-        updated.to_csv(CLASSIFIED_CSV, index=False)
+            # ── Local CSV (single-user / dev mode) ───────────────────────────
+            new_row_with_meta = new_row.copy()
+            combined_features = pd.concat(
+                [history[[c for c in history.columns if c in new_row.columns]],
+                 new_row_with_meta],
+                ignore_index=True,
+            )
+            combined_features.to_csv(HISTORY_CSV, index=False)
 
-        # Push to GitHub when running on Streamlit Community Cloud
-        try:
-            from cloud_storage import push_runs
-            push_runs(message=f"Analyse run {run_id}")
-        except Exception:
-            pass
+            classified_row = pd.DataFrame([classified_data])
+            if CLASSIFIED_CSV.exists():
+                existing = pd.read_csv(CLASSIFIED_CSV)
+                existing = existing[existing["run_id"] != run_id]
+                updated = pd.concat([existing, classified_row], ignore_index=True)
+            else:
+                updated = classified_row
+            updated.to_csv(CLASSIFIED_CSV, index=False)
+
+            # Push to GitHub when running on Streamlit Community Cloud
+            try:
+                from cloud_storage import push_runs
+                push_runs(message=f"Analyse run {run_id}")
+            except Exception:
+                pass
 
     return result, this_run, df_1s
 

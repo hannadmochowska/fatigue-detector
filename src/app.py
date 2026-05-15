@@ -26,35 +26,6 @@ from run_pipeline import CLASSIFIED_CSV, run_single
 
 load_dotenv()
 
-# ── Password gate ─────────────────────────────────────────────────────────────
-def _check_password() -> bool:
-    correct = os.environ.get("APP_PASSWORD", "")
-    if not correct:
-        return True  # no password set → open access (local dev)
-    if st.session_state.get("authenticated"):
-        return True
-    st.markdown("## 🏃 Fatigue Detector")
-    pwd = st.text_input("Enter password", type="password", key="pwd_input")
-    if st.button("Log in"):
-        if pwd == correct:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Incorrect password")
-    st.stop()
-    return False
-
-_check_password()
-
-# (v1 migration removed — classified_runs_v1.csv only contains raw features, no dates or labels)
-
-# ── Cloud storage: pull latest CSV from GitHub on each cold start ─────────────
-try:
-    from cloud_storage import ensure_local_up_to_date
-    ensure_local_up_to_date()
-except Exception:
-    pass
-
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Fatigue Detector",
@@ -62,6 +33,76 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def _auth() -> tuple[str | None, str | None]:
+    """
+    Multi-user mode (Supabase configured): show login/signup, return (user_id, access_token).
+    Single-user mode (no Supabase):        return (None, None) and skip gate entirely.
+    """
+    try:
+        from supabase_db import is_enabled, sign_in, sign_up
+        if not is_enabled():
+            raise ImportError  # fall through to single-user mode
+    except Exception:
+        # ── Local / single-user fallback: simple password gate ────────────────
+        pw_correct = os.environ.get("APP_PASSWORD", "")
+        if not pw_correct or st.session_state.get("authenticated"):
+            return None, None
+        st.markdown("## 🏃 Fatigue Detector")
+        pwd = st.text_input("Password", type="password", key="pw_input")
+        if st.button("Log in"):
+            if pwd == pw_correct:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+        st.stop()
+        return None, None
+
+    # ── Multi-user: full login / sign-up UI ───────────────────────────────────
+    if st.session_state.get("user_id"):
+        return st.session_state["user_id"], st.session_state.get("access_token")
+
+    st.markdown("## 🏃 Fatigue Detector")
+    tab_login, tab_signup = st.tabs(["Log in", "Create account"])
+
+    with tab_login:
+        email = st.text_input("Email", key="li_email")
+        password = st.text_input("Password", type="password", key="li_pwd")
+        if st.button("Log in", key="li_btn", type="primary", use_container_width=True):
+            try:
+                uid, token = sign_in(email, password)
+                st.session_state["user_id"] = uid
+                st.session_state["access_token"] = token
+                st.session_state["user_email"] = email
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with tab_signup:
+        st.caption("Create a free account to track your fatigue history across devices.")
+        email = st.text_input("Email", key="su_email")
+        password = st.text_input("Password (min 6 characters)", type="password", key="su_pwd")
+        if st.button("Create account", key="su_btn", use_container_width=True):
+            try:
+                sign_up(email, password)
+                st.success("Account created! Check your email to confirm, then log in.")
+            except Exception as e:
+                st.error(str(e))
+
+    st.stop()
+    return None, None
+
+_current_user_id, _access_token = _auth()
+
+# ── Cloud storage: pull latest CSV from GitHub (single-user / local mode only) ──
+if not _current_user_id:
+    try:
+        from cloud_storage import ensure_local_up_to_date
+        ensure_local_up_to_date()
+    except Exception:
+        pass
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 TYPE_COLORS = {
@@ -156,20 +197,26 @@ def _auto_analyse_all(
     source: str,
     g_email: str | None = None,
     g_password: str | None = None,
+    user_id: str | None = None,
 ) -> int:
     """
-    Silently run the pipeline on every activity not yet in classified_runs.csv.
+    Silently run the pipeline on every activity not yet analysed for this user.
     Uses session_type=None (auto-detect) and neuro_tag=None (neutral — no score impact).
     Returns the number of newly analysed runs.
     """
     # Build set of already-classified run_ids
     already_done: set[str] = set()
-    if CLASSIFIED_CSV.exists():
-        try:
+    try:
+        if user_id:
+            from supabase_db import load_runs, is_enabled
+            if is_enabled():
+                existing = load_runs(user_id)
+                already_done = set(existing["run_id"].dropna().astype(str)) if not existing.empty else set()
+        elif CLASSIFIED_CSV.exists():
             existing = pd.read_csv(CLASSIFIED_CSV)
             already_done = set(existing["run_id"].dropna().astype(str))
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     to_do = [a for a in activities if str(a["id"]) not in already_done]
     if not to_do:
@@ -201,6 +248,7 @@ def _auto_analyse_all(
                 session_type=None,
                 run_date=act.get("date"),
                 save_history=True,
+                user_id=user_id,
             )
             analysed += 1
         except Exception:
@@ -228,7 +276,17 @@ def _pace_str(pace_s: float) -> str:
     return f"{m}:{s:02d} /km"
 
 
-def _load_history() -> pd.DataFrame | None:
+def _load_history(user_id: str | None = None) -> pd.DataFrame | None:
+    # Multi-user: load from Supabase
+    if user_id:
+        try:
+            from supabase_db import load_runs, is_enabled
+            if is_enabled():
+                df = load_runs(user_id)
+                return df if len(df) > 0 else None
+        except Exception:
+            pass
+    # Single-user / local: load from CSV
     if CLASSIFIED_CSV.exists():
         try:
             df = pd.read_csv(CLASSIFIED_CSV)
@@ -397,7 +455,27 @@ def _history_section(df_hist: pd.DataFrame, current_result: dict | None = None):
 with st.sidebar:
     st.title("🏃 Fatigue Detector")
     st.caption("Central vs peripheral fatigue classifier")
+
+    # Show logged-in user + logout button (multi-user mode only)
+    if _current_user_id and st.session_state.get("user_email"):
+        st.caption(f"Logged in as **{st.session_state['user_email']}**")
+        if st.button("Log out", key="logout_btn"):
+            for k in ["user_id", "access_token", "user_email", "authenticated",
+                      "result", "df_1s", "run_id", "activities", "source"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
     st.divider()
+
+    # Load saved integrations for this user (pre-fills Garmin/Strava fields)
+    _saved_creds: dict = {}
+    if _current_user_id:
+        try:
+            from supabase_db import load_integrations, is_enabled
+            if is_enabled():
+                _saved_creds = load_integrations(_current_user_id)
+        except Exception:
+            pass
 
     source = st.radio("Data source",
                       ["Garmin Connect", "Strava", "Upload TCX file"],
@@ -405,9 +483,12 @@ with st.sidebar:
 
     if source == "Garmin Connect":
         st.subheader("Garmin Connect")
-        email = st.text_input("Email", value=os.environ.get("GARMIN_EMAIL", ""), key="g_email")
+        email = st.text_input("Email",
+            value=_saved_creds.get("garmin_email") or os.environ.get("GARMIN_EMAIL", ""),
+            key="g_email")
         password = st.text_input("Password", type="password",
-                                 value=os.environ.get("GARMIN_PASSWORD", ""), key="g_pass")
+            value=_saved_creds.get("garmin_password") or os.environ.get("GARMIN_PASSWORD", ""),
+            key="g_pass")
         days = st.slider("Look back (days)", 7, 90, 30, key="g_days")
         if st.button("Load recent runs", key="g_load"):
             with st.spinner("Connecting to Garmin…"):
@@ -419,7 +500,14 @@ with st.sidebar:
                     st.session_state["g_email_cached"] = email
                     st.session_state["g_pass_cached"] = password
                     _patch_missing_dates(acts)
-                    n_new = _auto_analyse_all(acts, "garmin", g_email=email, g_password=password)
+                    # Save credentials for this user
+                    if _current_user_id:
+                        try:
+                            from supabase_db import save_integrations
+                            save_integrations(_current_user_id, {"garmin_email": email, "garmin_password": password})
+                        except Exception:
+                            pass
+                    n_new = _auto_analyse_all(acts, "garmin", g_email=email, g_password=password, user_id=_current_user_id)
                     msg = f"Found {len(acts)} runs"
                     if n_new:
                         msg += f" · auto-analysed {n_new} new"
@@ -429,12 +517,22 @@ with st.sidebar:
 
     elif source == "Strava":
         st.subheader("Strava")
-        missing = [k for k in ("STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_REFRESH_TOKEN")
-                   if not os.environ.get(k)]
-        if missing:
-            st.warning("Missing from `.env`:\n" + "\n".join(f"- `{k}`" for k in missing))
+        # In multi-user mode, users enter their own Strava credentials
+        if _current_user_id:
+            _s_id     = st.text_input("Client ID",     value=_saved_creds.get("strava_client_id", ""),     key="s_client_id")
+            _s_secret = st.text_input("Client Secret", value=_saved_creds.get("strava_client_secret", ""), key="s_client_secret", type="password")
+            _s_token  = st.text_input("Refresh Token", value=_saved_creds.get("strava_refresh_token", ""), key="s_refresh_token", type="password")
+            if _s_id:
+                os.environ["STRAVA_CLIENT_ID"]     = _s_id
+                os.environ["STRAVA_CLIENT_SECRET"] = _s_secret
+                os.environ["STRAVA_REFRESH_TOKEN"] = _s_token
         else:
-            st.success("Strava credentials found ✓")
+            missing = [k for k in ("STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_REFRESH_TOKEN")
+                       if not os.environ.get(k)]
+            if missing:
+                st.warning("Missing from `.env`:\n" + "\n".join(f"- `{k}`" for k in missing))
+            else:
+                st.success("Strava credentials found ✓")
         days = st.slider("Look back (days)", 7, 90, 30, key="s_days")
         if st.button("Load recent runs", key="s_load"):
             with st.spinner("Fetching from Strava…"):
@@ -444,7 +542,18 @@ with st.sidebar:
                     st.session_state["activities"] = acts
                     st.session_state["source"] = "strava"
                     _patch_missing_dates(acts)
-                    n_new = _auto_analyse_all(acts, "strava")
+                    # Save Strava credentials for this user
+                    if _current_user_id:
+                        try:
+                            from supabase_db import save_integrations
+                            save_integrations(_current_user_id, {
+                                "strava_client_id":     os.environ.get("STRAVA_CLIENT_ID", ""),
+                                "strava_client_secret": os.environ.get("STRAVA_CLIENT_SECRET", ""),
+                                "strava_refresh_token": os.environ.get("STRAVA_REFRESH_TOKEN", ""),
+                            })
+                        except Exception:
+                            pass
+                    n_new = _auto_analyse_all(acts, "strava", user_id=_current_user_id)
                     msg = f"Found {len(acts)} runs"
                     if n_new:
                         msg += f" · auto-analysed {n_new} new"
@@ -509,7 +618,8 @@ with st.sidebar:
                     result, _, df_1s = run_single(df_raw, run_id=run_id,
                                                    neuro_tag=neuro_tag,
                                                    session_type=session_type,
-                                                   run_date=selected.get("date"))
+                                                   run_date=selected.get("date"),
+                                                   user_id=_current_user_id)
                     st.session_state["result"] = result
                     st.session_state["df_1s"] = df_1s
                     st.session_state["run_id"] = run_id
@@ -522,7 +632,7 @@ with st.sidebar:
 
 # ── Main panel ────────────────────────────────────────────────────────────────
 result: dict | None = st.session_state.get("result")
-df_hist = _load_history()
+df_hist = _load_history(_current_user_id)
 
 if result is None:
     # Landing: no run analysed yet

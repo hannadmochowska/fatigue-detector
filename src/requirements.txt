@@ -5,3 +5,5 @@ plotly
 requests
 python-dotenv
 garminconnect
+supabase
+cryptography
