@@ -483,11 +483,14 @@ with st.sidebar:
 
     if source == "Garmin Connect":
         st.subheader("Garmin Connect")
+        # Pre-fill only from this user's saved Supabase credentials (never from env/secrets)
+        _garmin_default_email = _saved_creds.get("garmin_email", "") if _current_user_id else os.environ.get("GARMIN_EMAIL", "")
+        _garmin_default_pass  = _saved_creds.get("garmin_password", "") if _current_user_id else os.environ.get("GARMIN_PASSWORD", "")
         email = st.text_input("Email",
-            value=_saved_creds.get("garmin_email") or os.environ.get("GARMIN_EMAIL", ""),
+            value=_garmin_default_email,
             key="g_email")
         password = st.text_input("Password", type="password",
-            value=_saved_creds.get("garmin_password") or os.environ.get("GARMIN_PASSWORD", ""),
+            value=_garmin_default_pass,
             key="g_pass")
         days = st.slider("Look back (days)", 7, 90, 30, key="g_days")
         if st.button("Load recent runs", key="g_load"):
