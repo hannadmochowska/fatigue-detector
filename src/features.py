@@ -762,7 +762,7 @@ def compute_cml_gpv_scores(features_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     df["CML_phys_z"] = np.where(
-        df["is_hilly_run"] & df["CML_flat_z"].notna(),
+        df["is_hilly_run"].astype(bool) & df["CML_flat_z"].notna(),
         df["CML_flat_z"],
         df["CML_full_z"],
     )
