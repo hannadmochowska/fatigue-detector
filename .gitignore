@@ -1,1 +1,4 @@
-*.tcx
+*.tcx.env
+.garmin_tokens/
+__pycache__/
+.DS_Store
