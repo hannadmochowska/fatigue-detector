@@ -28,7 +28,7 @@ def resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     # columns to resample with mean + interpolate
     cols = ["speed_mps", "pace_s_per_km", "hr", "cadence", "distance_m", "elev_m"]
 
-    df_1s = df[cols].resample("1S").mean()
+    df_1s = df[cols].resample("1s").mean()
 
     # interpolate through gaps
     for col in cols:
